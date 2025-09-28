@@ -9,4 +9,4 @@ class QueryRequest(BaseModel):
 
 @router.post("/query")
 async def query_rag(request: QueryRequest):
-    return rag_answer(request.query)
+    return await rag_answer(request.query)

@@ -1,20 +1,22 @@
 import logging
+import os
+import asyncio
+import numpy as np
 from datasets import load_dataset
 from sentence_transformers import SentenceTransformer
 import faiss
 import google.generativeai as genai
-import numpy as np
 from collections import defaultdict
 from functools import lru_cache
 from transformers import AutoTokenizer, AutoModel
 import torch
-import matplotlib.pyplot as plt
-import io
-import base64
+import pandas as pd
 import nltk
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from rouge_score import rouge_scorer
 from ..core.config import settings
+import time
+import asyncio
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -22,7 +24,6 @@ logger = logging.getLogger(__name__)
 
 # Download NLTK data
 nltk.download("punkt", quiet=True)
-nltk.download("punkt_tab", quiet=True)
 
 # Configure Gemini
 try:
@@ -33,185 +34,207 @@ except Exception as e:
     logger.error(f"Failed to initialize Gemini API: {e}")
     raise
 
-# Load dataset
-try:
-    logger.info("Loading dataset...")
-    ds = load_dataset("Amod/mental_health_counseling_conversations")
-    train = ds["train"]
-    contexts = train["Context"]
-    responses = train["Response"]
-    logger.info(f"Loaded dataset with {len(contexts)} contexts")
-except Exception as e:
-    logger.error(f"Failed to load dataset: {e}")
-    raise
+# Paths for caching
+DATASET_CACHE = "mental_health_dataset.parquet"
+EMBEDDINGS_CACHE = "context_embeddings.npy"
+INDEX_CACHE = "faiss_index.bin"
 
-# Map context to responses
-context_to_responses = defaultdict(list)
-for c, r in zip(contexts, responses):
-    context_to_responses[c].append(r)
+# Load or preprocess dataset
+def load_or_preprocess_dataset():
+    if os.path.exists(DATASET_CACHE):
+        logger.info("Loading cached dataset...")
+        df = pd.read_parquet(DATASET_CACHE)
+    else:
+        logger.info("Loading and preprocessing dataset...")
+        ds = load_dataset("Amod/mental_health_counseling_conversations")
+        train = ds["train"]
+        df = pd.DataFrame({"Context": train["Context"], "Response": train["Response"]})
+
+        # Clean dataset
+        df = df.dropna(subset=['Context', 'Response'])
+        df = df[df['Context'].str.strip() != ""]
+        df = df[df['Response'].str.strip() != ""]
+        df['Context'] = df['Context'].str.strip()
+        df['Response'] = df['Response'].str.strip()
+        df = df.drop_duplicates(subset=['Context', 'Response']).reset_index(drop=True)
+        
+        # Save to cache
+        df.to_parquet(DATASET_CACHE)
+        logger.info(f"Saved cleaned dataset to {DATASET_CACHE}")
+    
+    return df
 
 # Initialize embedding model and FAISS index
-try:
-    logger.info("Initializing embedding model and FAISS index...")
+def initialize_embeddings_and_index(df, use_ivf=False):
     embed_model = SentenceTransformer(settings.EMBEDDING_MODEL)
-    context_embeddings = embed_model.encode(contexts, convert_to_numpy=True, show_progress_bar=True)
-    faiss.normalize_L2(context_embeddings)
-    d = context_embeddings.shape[1]
-    index = faiss.IndexFlatIP(d)
-    index.add(context_embeddings)
-    logger.info(f"Created FAISS index with {index.ntotal} vectors")
+    d = embed_model.get_sentence_embedding_dimension()
+    
+    if (os.path.exists(EMBEDDINGS_CACHE) and 
+        os.path.exists(INDEX_CACHE) and 
+        np.load(EMBEDDINGS_CACHE).shape[1] == d):
+        logger.info("Loading cached embeddings and FAISS index...")
+        context_embeddings = np.load(EMBEDDINGS_CACHE)
+        index = faiss.read_index(INDEX_CACHE)
+    else:
+        logger.info("Generating embeddings and FAISS index...")
+        context_embeddings = embed_model.encode(df['Context'].tolist(), convert_to_numpy=True, show_progress_bar=True)
+        faiss.normalize_L2(context_embeddings)
+        
+        d = context_embeddings.shape[1]
+        if use_ivf:
+            nlist = min(100, len(df))  # Number of clusters for IVF index
+            quantizer = faiss.IndexFlatIP(d)
+            index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+            index.train(context_embeddings)
+        else:
+            index = faiss.IndexFlatIP(d)
+        
+        index.add(context_embeddings)
+        
+        # Save to cache
+        np.save(EMBEDDINGS_CACHE, context_embeddings)
+        faiss.write_index(index, INDEX_CACHE)
+        logger.info(f"Saved embeddings to {EMBEDDINGS_CACHE} and index to {INDEX_CACHE}")
+    
+    return embed_model, context_embeddings, index
+
+# Load dataset and initialize
+try:
+    df = load_or_preprocess_dataset()
+    contexts = df['Context'].tolist()
+    context_to_responses = defaultdict(list)
+    for c, r in zip(df['Context'], df['Response']):
+        context_to_responses[c].append(r)
+    
+    # Use IndexFlatIP for small datasets, switch to IndexIVFFlat for large datasets
+    embed_model, context_embeddings, index = initialize_embeddings_and_index(df, use_ivf=len(df) > 10000)
+    logger.info(f"Loaded {len(contexts)} unique contexts and initialized FAISS index")
 except Exception as e:
-    logger.error(f"Failed to initialize embedding model or FAISS: {e}")
+    logger.error(f"Failed to initialize: {e}")
     raise
 
-# Initialize tokenizer and model for attention analysis
+# Initialize tokenizer and model for attention analysis (optional)
 try:
     tokenizer = AutoTokenizer.from_pretrained(settings.EMBEDDING_MODEL)
     transformer_model = AutoModel.from_pretrained(settings.EMBEDDING_MODEL, output_attentions=True)
+    transformer_model.eval()  # Set to evaluation mode
     logger.info("Initialized transformer model for attention analysis")
 except Exception as e:
     logger.error(f"Failed to initialize transformer model: {e}")
-    raise
+    transformer_model = None
 
-@lru_cache(maxsize=100)
-def encode_query(query: str) -> np.ndarray:
-    """Cache query embeddings to avoid re-encoding."""
+async def encode_query(query: str) -> np.ndarray:
+    loop = asyncio.get_event_loop()
     logger.info(f"Encoding query: {query}")
-    q_emb = embed_model.encode([query], convert_to_numpy=True)
+    q_emb = await loop.run_in_executor(None, lambda: embed_model.encode([query], convert_to_numpy=True))
     faiss.normalize_L2(q_emb)
     return q_emb
 
-def pure_gemini(query: str) -> str:
-    try:
-        prompt = f"Answer empathetically as a counselor: {query}\nResponse:"
-        response = llm.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        logger.error(f"Pure Gemini failed: {e}")
-        return f"Error: {str(e)}"
+async def pure_gemini(query: str, max_retries=3) -> str:
+    for attempt in range(max_retries):
+        try:
+            prompt = f"Answer empathetically as a counselor: {query}\nResponse:"
+            response = await asyncio.wait_for(llm.generate_content_async(prompt), timeout=30.0)
+            return response.text
+        except BaseException as e:
+            logger.warning(f"Gemini API attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+            else:
+                logger.error("Failed to generate response after retries")
+                return f"Error: {str(e)}"
 
-def calculate_metrics(reference: str, candidate: str) -> dict:
+def calculate_metrics(reference: str, candidate: str, include_rouge2=False) -> dict:
     try:
-        # BLEU with smoothing
         ref_tokens = [nltk.word_tokenize(reference)]
         cand_tokens = nltk.word_tokenize(candidate)
         bleu = sentence_bleu(ref_tokens, cand_tokens, smoothing_function=SmoothingFunction().method1)
-
-        # ROUGE
-        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+        rouge_types = ['rouge1', 'rougeL']
+        if include_rouge2:
+            rouge_types.append('rouge2')
+        scorer = rouge_scorer.RougeScorer(rouge_types, use_stemmer=True)
         rouge = scorer.score(reference, candidate)
-
         return {
             "bleu": bleu,
-            "rouge": {
-                "rouge1": rouge['rouge1'].fmeasure,
-                "rouge2": rouge['rouge2'].fmeasure,
-                "rougeL": rouge['rougeL'].fmeasure
-            }
+            "rouge": {rt: rouge[rt].fmeasure for rt in rouge_types}
         }
     except Exception as e:
         logger.error(f"Error calculating metrics: {e}")
-        return {"bleu": 0.0, "rouge": {"rouge1": 0.0, "rouge2": 0.0, "rougeL": 0.0}}
+        return {"bleu": 0.0, "rouge": {rt: 0.0 for rt in rouge_types}}
 
-def analyze_attention(query: str) -> dict:
-    try:
-        # Tokenize and run model
-        inputs = tokenizer(query, return_tensors="pt")
-        outputs = transformer_model(**inputs)
-
-        # Extract attention weights (average across layers and heads)
-        attentions = outputs.attentions
-        avg_attention = torch.mean(torch.stack(attentions), dim=0).mean(dim=1).squeeze(0).detach().numpy()
-        tokens = tokenizer.tokenize(query)
-
-        # Generate attention matrix plot
-        plt.figure(figsize=(10, 8))
-        plt.imshow(avg_attention, cmap='hot', interpolation='nearest')
-        plt.xticks(np.arange(len(tokens)), tokens, rotation=90)
-        plt.yticks(np.arange(len(tokens)), tokens)
-        plt.colorbar()
-        plt.title("Average Attention Matrix for Query")
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png')
-        buf.seek(0)
-        img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-        plt.close()
-
-        # Analyze attention for mental health keywords
-        keywords = ["depressed", "anxious", "worthless", "stress", "sad"]
-        keyword_attention = {}
-        for keyword in keywords:
-            if keyword in tokens:
-                idx = tokens.index(keyword)
-                keyword_attention[keyword] = {
-                    "attention_weights": avg_attention[idx].tolist(),
-                    "top_attended_tokens": [tokens[i] for i in np.argsort(avg_attention[idx])[::-1][:3]]
-                }
-
-        return {
-            "tokens": tokens,
-            "attention_matrix": img_base64,
-            "keyword_attention": keyword_attention
-        }
-    except Exception as e:
-        logger.error(f"Error analyzing attention: {e}")
-        return {"error": str(e)}
-
-def rag_answer(query: str, top_k: int = settings.TOP_K) -> dict:
+async def rag_answer(query: str, top_k: int = settings.TOP_K, include_attention: bool = False, include_rouge2: bool = False) -> dict:
+    prompt = "" 
     try:
         logger.info(f"Processing query: {query}")
-        # Encode query (cached)
-        q_emb = encode_query(query)
+        q_emb = await encode_query(query)
 
         # Search top-k contexts
         D, I = index.search(q_emb, top_k)
-        retrieved_contexts = [contexts[i] for i in I[0]]
-        logger.info(f"Retrieved {len(retrieved_contexts)} contexts")
+        logger.info(f"Retrieved {len(I[0])} contexts")
 
-        # Get corresponding responses
+        # Deduplicate context-response pairs with scores
+        seen_pairs = set()
         retrieved_pairs = []
-        for ctx in retrieved_contexts:
+
+        for rank, ctx_idx in enumerate(I[0]):
+            ctx = contexts[ctx_idx]
+            score = float(D[0][rank])  # inner product score
             for resp in context_to_responses[ctx]:
-                retrieved_pairs.append([ctx, resp])
+                pair = (ctx, resp)
+                if pair not in seen_pairs:
+                    retrieved_pairs.append({
+                        "context": ctx,
+                        "response": resp,
+                        "score": score
+                    })
+                    seen_pairs.add(pair)
+
+        logger.info(f"Prepared {len(retrieved_pairs)} unique context-response pairs with scores")
 
         # Build prompt
         prompt = (
             "You are a helpful and empathetic counselor.\n\n"
             "Here are some similar cases with responses:\n"
-            + "\n\n".join(f"Context: {ctx}\nResponse: {resp}" for ctx, resp in retrieved_pairs)
+            + "\n\n".join(f"Context: {item['context']}\nResponse: {item['response']}" for item in retrieved_pairs)
             + f"\n\nNow answer the new query:\n{query}\nResponse:"
         )
-
-        # Call Gemini with retry logic
+        # Call Gemini with exponential backoff
         rag_response = None
         for attempt in range(3):
             try:
-                response = llm.generate_content(prompt)
+                response = await asyncio.wait_for(llm.generate_content_async(prompt), timeout=30.0)
                 rag_response = response.text
                 logger.info("Generated response successfully")
                 break
-            except Exception as e:
-                logger.warning(f"Gemini API attempt {attempt + 1} failed: {e}")
-                if attempt == 2:
-                    logger.error("Failed to generate response after 3 attempts")
-                    rag_response = "Error: Could not generate response. Please try again."
+            except asyncio.TimeoutError:
+                logger.warning(f"Gemini API attempt {attempt + 1} timed out")
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    rag_response = "Error: Response generation timed out."
+            except BaseException as e:
+                logger.error(f"Gemini API attempt {attempt + 1} failed: {repr(e)}")
+                rag_response = f"Error: {repr(e)}"
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    rag_response = f"Error: {str(e)}"
 
         # Get pure Gemini response
-        gemini_response = pure_gemini(query)
+        gemini_response = await pure_gemini(query)
 
-        # Use first retrieved response as ground truth for evaluation
-        ground_truth = retrieved_pairs[0][1] if retrieved_pairs else ""
+        # Use first retrieved response as ground truth
+        ground_truth = retrieved_pairs[0]['response'] if retrieved_pairs else ""
 
         # Calculate metrics
-        rag_metrics = calculate_metrics(ground_truth, rag_response)
-        gemini_metrics = calculate_metrics(ground_truth, gemini_response)
+        rag_metrics = calculate_metrics(ground_truth, rag_response, include_rouge2)
+        gemini_metrics = calculate_metrics(ground_truth, gemini_response, include_rouge2)
 
-        # Analyze attention
-        attention_result = analyze_attention(query)
-
+       
         return {
             "query": query,
             "retrieved": retrieved_pairs,
+            "prompt": prompt,
             "generated": rag_response,
             "evaluation": {
                 "rag_response": rag_response,
@@ -220,15 +243,15 @@ def rag_answer(query: str, top_k: int = settings.TOP_K) -> dict:
                 "rag_metrics": rag_metrics,
                 "gemini_metrics": gemini_metrics
             },
-            "attention_analysis": attention_result
+            "disclaimer": "This is not medical advice. Consult a professional for mental health support."
         }
     except Exception as e:
         logger.error(f"Error processing query: {e}")
         return {
             "query": query,
             "retrieved": [],
+            "prompt": prompt,
             "generated": f"Error: {str(e)}",
             "disclaimer": "This is not medical advice. Consult a professional for mental health support.",
             "evaluation": {"error": str(e)},
-            "attention_analysis": {"error": str(e)}
         }

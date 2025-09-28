@@ -1,5 +1,8 @@
 from pydantic_settings import BaseSettings
+from pathlib import Path
 
+BASE_DIR = Path(__file__).resolve().parents[3] 
+ENV_PATH = BASE_DIR / ".env"
 
 class Settings(BaseSettings):
     EMBEDDING_MODEL: str
@@ -9,8 +12,7 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str
 
     class Config:
-        env_file = ".env"
+        env_file = ENV_PATH
         env_file_encoding = "utf-8"
-
 
 settings = Settings()
