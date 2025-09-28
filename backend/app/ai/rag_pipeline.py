@@ -21,7 +21,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Download NLTK data
-nltk.download('punkt')
+nltk.download("punkt", quiet=True)
+nltk.download("punkt_tab", quiet=True)
 
 # Configure Gemini
 try:
