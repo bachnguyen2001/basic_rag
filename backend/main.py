@@ -1,9 +1,19 @@
 from fastapi import FastAPI
-from app.api.v1 import rag
+from fastapi.middleware.cors import CORSMiddleware
+from app.api.v1.rag import router as rag_router
 
-app = FastAPI(title="Mental Health RAG API")
-app.include_router(rag.router, prefix="/api/v1")
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(rag_router, prefix="/api/v1/rag")
 
 @app.get("/")
 async def root():
-    return {"message": "Mental Health RAG API"}
+    return {"message": "Welcome to the Mental Health Counseling RAG API"}
